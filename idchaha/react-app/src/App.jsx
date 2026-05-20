@@ -19,7 +19,8 @@ function App() {
   const sourceRef = useRef(null)
 
   useEffect(() => {
-    fetch('/api/stats')
+    fetch('/api/session', { credentials: 'include' })
+      .then(() => fetch('/api/stats', { credentials: 'include' }))
       .then((response) => response.json())
       .then((payload) => setSearchCount(payload.searches ?? 0))
       .catch(() => {})
@@ -34,11 +35,24 @@ function App() {
       : null
   }, [parsedId, result])
 
-  function search(event) {
+  async function search(event) {
     event.preventDefault()
 
     if (!parsedId) {
       setStatus('use player#tag')
+      setStatusType('error')
+      return
+    }
+
+    try {
+      const sessionResponse = await fetch('/api/session', { credentials: 'include' })
+      if (!sessionResponse.ok) {
+        setStatus('search blocked')
+        setStatusType('error')
+        return
+      }
+    } catch {
+      setStatus('search blocked')
       setStatusType('error')
       return
     }
@@ -60,7 +74,7 @@ function App() {
       region,
     })
 
-    const source = new EventSource(`/api/search-stream?${params}`)
+    const source = new EventSource(`/api/search?${params}`)
     sourceRef.current = source
 
     source.addEventListener('progress', (event) => {
@@ -96,9 +110,14 @@ function App() {
     })
 
     source.addEventListener('error', (event) => {
-      const message = event.data
-        ? JSON.parse(event.data).error
-        : 'search connection closed'
+      let message = 'search connection closed'
+      if (event.data) {
+        try {
+          message = JSON.parse(event.data).error ?? message
+        } catch {
+          message = event.data
+        }
+      }
       const cleanMessage = cleanErrorMessage(message)
       setStatus(cleanMessage)
       setStatusType('error')
@@ -430,6 +449,14 @@ function shouldLogLine(payload, message) {
 
 function cleanErrorMessage(message) {
   const lower = String(message || '').toLowerCase()
+  if (lower.includes('too many searches')) {
+    return 'too many searches, try again later'
+  }
+
+  if (lower.includes('unauthorized') || lower.includes('forbidden')) {
+    return 'search blocked'
+  }
+
   if (lower.includes('account not found') || lower.includes('could not find player')) {
     return 'account not found'
   }

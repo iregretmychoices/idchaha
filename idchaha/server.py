@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -13,6 +14,16 @@ from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlparse, parse_qs
 from urllib.request import Request, urlopen
+
+
+def env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
 
 
 HENRIK_API_KEYS = [
@@ -29,6 +40,22 @@ KEY_LOCK = Lock()
 KEY_INDEX = 0
 STATS_FILE = PROJECT_ROOT / "search_stats.json"
 STATS_LOCK = Lock()
+ALLOWED_HOSTS = {
+    host.strip().lower()
+    for host in os.environ.get(
+        "ALLOWED_HOSTS",
+        "idchaha.lol,www.idchaha.lol,localhost,127.0.0.1",
+    ).split(",")
+    if host.strip()
+}
+SESSION_TTL = env_int("SESSION_TTL_SECONDS", 3600)
+RATE_LIMIT_PER_HOUR = env_int("RATE_LIMIT_SEARCHES_PER_HOUR", 20)
+RATE_LIMIT_BURST = env_int("RATE_LIMIT_BURST_PER_MINUTE", 4)
+SESSION_COOKIE = "site_session"
+SESSION_LOCK = Lock()
+RATE_LOCK = Lock()
+SESSIONS: dict[str, float] = {}
+RATE_BUCKETS: dict[str, list[float]] = {}
 
 
 class ValorantSiteHandler(SimpleHTTPRequestHandler):
@@ -37,40 +64,128 @@ class ValorantSiteHandler(SimpleHTTPRequestHandler):
 
     def do_GET(self) -> None:
         parsed = urlparse(self.path)
-        if parsed.path == "/api/search-stream":
-            self.handle_search_stream(parsed.query)
+        if parsed.path == "/api/session":
+            self.handle_session()
             return
         if parsed.path == "/api/search":
             self.handle_search(parsed.query)
             return
         if parsed.path == "/api/stats":
+            if not self.is_allowed_origin():
+                self.send_json({"error": "Forbidden"}, status=403)
+                return
             self.send_json({"searches": read_search_count()})
             return
         if ROOT == REACT_DIST and not (ROOT / parsed.path.lstrip("/")).exists():
             self.path = "/index.html"
         super().do_GET()
 
-    def handle_search(self, query: str) -> None:
-        params = parse_qs(query)
-        name = first(params, "name")
-        tag = first(params, "tag")
-        region = first(params, "region", "na").lower()
+    def client_ip(self) -> str:
+        forwarded = self.headers.get("X-Forwarded-For", "")
+        if forwarded:
+            return forwarded.split(",")[0].strip()
+        return self.client_address[0]
 
-        if not name or not tag:
-            self.send_json({"error": "Use the format Player#TAG."}, status=400)
+    def request_host(self) -> str:
+        host = self.headers.get("Host", "")
+        return host.split(":")[0].lower() if host else ""
+
+    def is_allowed_origin(self) -> bool:
+        hostname = self.request_host()
+        if hostname in ALLOWED_HOSTS:
+            return True
+
+        for header in (self.headers.get("Origin", ""), self.headers.get("Referer", "")):
+            if not header:
+                continue
+            parsed = urlparse(header)
+            if parsed.hostname and parsed.hostname.lower() in ALLOWED_HOSTS:
+                return True
+
+        return False
+
+    def get_cookie(self, name: str) -> str | None:
+        raw = self.headers.get("Cookie", "")
+        prefix = f"{name}="
+        for part in raw.split(";"):
+            part = part.strip()
+            if part.startswith(prefix):
+                return part[len(prefix):]
+        return None
+
+    def cookie_flags(self, max_age: int) -> str:
+        secure = self.request_host() not in ("localhost", "127.0.0.1")
+        flags = f"HttpOnly; SameSite=Lax; Path=/; Max-Age={max_age}"
+        if secure:
+            flags = f"Secure; {flags}"
+        return flags
+
+    def prune_sessions(self, now: float) -> None:
+        expired = [token for token, expiry in SESSIONS.items() if expiry <= now]
+        for token in expired:
+            SESSIONS.pop(token, None)
+
+    def issue_session_token(self) -> str:
+        token = secrets.token_urlsafe(32)
+        expiry = time.time() + SESSION_TTL
+        with SESSION_LOCK:
+            self.prune_sessions(time.time())
+            SESSIONS[token] = expiry
+        return token
+
+    def has_valid_session(self) -> bool:
+        token = self.get_cookie(SESSION_COOKIE)
+        if not token:
+            return False
+        now = time.time()
+        with SESSION_LOCK:
+            expiry = SESSIONS.get(token)
+            if not expiry or expiry <= now:
+                SESSIONS.pop(token, None)
+                return False
+            SESSIONS[token] = now + SESSION_TTL
+            return True
+
+    def check_rate_limit(self, ip: str) -> bool:
+        now = time.time()
+        with RATE_LOCK:
+            hits = [stamp for stamp in RATE_BUCKETS.get(ip, []) if now - stamp < 3600]
+            recent = [stamp for stamp in hits if now - stamp < 60]
+            if len(hits) >= RATE_LIMIT_PER_HOUR or len(recent) >= RATE_LIMIT_BURST:
+                RATE_BUCKETS[ip] = hits
+                return False
+            hits.append(now)
+            RATE_BUCKETS[ip] = hits
+            return True
+
+    def guard_search_api(self) -> str | None:
+        if not self.is_allowed_origin():
+            return "Forbidden"
+        if not self.has_valid_session():
+            return "Unauthorized"
+        if not self.check_rate_limit(self.client_ip()):
+            return "Too many searches. Try again later."
+        return None
+
+    def handle_session(self) -> None:
+        if not self.is_allowed_origin():
+            self.send_json({"error": "Forbidden"}, status=403)
+            return
+        token = self.issue_session_token()
+        body = json.dumps({"ok": True}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Set-Cookie", f"{SESSION_COOKIE}={token}; {self.cookie_flags(SESSION_TTL)}")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def handle_search(self, query: str) -> None:
+        blocked = self.guard_search_api()
+        if blocked:
+            self.send_json({"error": blocked}, status=403 if blocked == "Forbidden" else 429 if "many" in blocked else 401)
             return
 
-        try:
-            search_count = increment_search_count()
-            payload = build_lookup(name, tag, region)
-            payload["search_count"] = search_count
-            self.send_json(payload)
-        except LookupError as exc:
-            self.send_json({"error": str(exc)}, status=404)
-        except Exception as exc:
-            self.send_json({"error": f"Lookup failed: {exc}"}, status=500)
-
-    def handle_search_stream(self, query: str) -> None:
         params = parse_qs(query)
         name = first(params, "name")
         tag = first(params, "tag")
