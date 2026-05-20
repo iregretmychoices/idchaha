@@ -1,0 +1,39 @@
+:root {
+  --bg: #000;
+  --text: #f4f4f4;
+  --muted: #8d8d96;
+  --quiet: #5c5c66;
+  --line: #24242b;
+  --lineBright: #565660;
+  --panel: #050505;
+
+  font-family: Verdana, Geneva, sans-serif;
+  color: var(--text);
+  background: var(--bg);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: #000;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+::selection {
+  color: #000;
+  background: #f4f4f4;
+}

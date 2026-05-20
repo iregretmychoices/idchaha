@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: idchaha
+    runtime: python
+    plan: free
+    buildCommand: cd react-app && npm install && npm run build
+    startCommand: python server.py
+    envVars:
+      - key: HENRIK_API_KEYS
+        sync: false
