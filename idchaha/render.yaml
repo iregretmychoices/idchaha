@@ -3,7 +3,7 @@ services:
     name: idchaha
     runtime: python
     plan: free
-    buildCommand: cd react-app && npm install && npm run build
+    buildCommand: pip install -r requirements.txt && cd react-app && npm install && npm run build
     startCommand: python server.py
     envVars:
       - key: HENRIK_API_KEYS
